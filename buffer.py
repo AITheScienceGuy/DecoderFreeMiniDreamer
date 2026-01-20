@@ -2,126 +2,185 @@
 
 import numpy as np
 import torch
+from collections import deque
 
 class ReplayBuffer:
-    def __init__(self, capacity=5000, num_envs=16, seq_len=50):
-        """
-        capacity: Number of time steps PER environment.
-        Total frames stored = capacity * num_envs.
-        """
+    def __init__(self, capacity=10000, num_envs=8, seq_len=50):
         self.capacity = capacity
         self.num_envs = num_envs
         self.seq_len = seq_len
         self.pos = 0
         self.full = False
         
-        # Storage: (Time, Env, Channels, H, W)
-        # Using uint8 to save RAM (converted to float in sample)
+        # 1. Image Observation (Current)
         self.obs = np.zeros((capacity, num_envs, 4, 64, 64), dtype=np.uint8)
+        # 2. Image Observation (Next/Target) - Explicit storage for correctness
+        self.next_obs = np.zeros((capacity, num_envs, 4, 64, 64), dtype=np.uint8)
+        # 3. Action taken
         self.actions = np.zeros((capacity, num_envs), dtype=np.int64)
+        # 4. Reward received
         self.rewards = np.zeros((capacity, num_envs), dtype=np.float32)
+        # 5. Episode Boundary (Terminated OR Truncated OR Life Loss)
         self.dones = np.zeros((capacity, num_envs), dtype=np.float32)
+        # 6. Real Terminal (Terminated ONLY)
+        self.terminals = np.zeros((capacity, num_envs), dtype=np.float32)
 
-    def add_batch(self, obs_batch, act_batch, rew_batch, done_batch):
-        """
-        Expects batches of shape (Num_Envs, ...)
-        We write to the current time 'pos' across all envs at once.
-        """
+        # Event Anchors: Deques of (buffer_index, env_index)
+        self.term_indices = deque()
+        self.rew_indices = deque()
+
+    def add_batch(self, obs_batch, next_obs_batch, act_batch, rew_batch, done_batch, term_batch, rew_eps=0.01):
         if obs_batch.dtype != np.uint8:
             obs_batch = (obs_batch * 255).astype(np.uint8)
+        if next_obs_batch.dtype != np.uint8:
+            next_obs_batch = (next_obs_batch * 255).astype(np.uint8)
             
+        # FIX: Instead of clearing everything on wrap, remove only overwritten anchors
+        if self.full:
+            # We are about to overwrite self.pos. Remove any anchors pointing to this index.
+            # Since we add sequentially, the oldest anchors (matching self.pos) are at the left.
+            while len(self.term_indices) > 0 and self.term_indices[0][0] == self.pos:
+                self.term_indices.popleft()
+            
+            while len(self.rew_indices) > 0 and self.rew_indices[0][0] == self.pos:
+                self.rew_indices.popleft()
+
         self.obs[self.pos] = obs_batch
+        self.next_obs[self.pos] = next_obs_batch
         self.actions[self.pos] = act_batch
         self.rewards[self.pos] = rew_batch
         self.dones[self.pos] = done_batch
+        self.terminals[self.pos] = term_batch
         
+        # Update Anchors
+        term_envs = np.where(term_batch > 0.5)[0]
+        for env_idx in term_envs:
+            self.term_indices.append((self.pos, env_idx))
+            
+        rew_envs = np.where(np.abs(rew_batch) > rew_eps)[0]
+        for env_idx in rew_envs:
+            self.rew_indices.append((self.pos, env_idx))
+
         self.pos += 1
         if self.pos >= self.capacity:
             self.full = True
             self.pos = 0
 
-    def sample_sequence(self, batch_size, recent_only_pct=1.0):
-        """
-        Samples (B, T, ...) valid sequences.
-        recent_only_pct: If < 1.0, restricts sampling to the most recent % of data.
-        """
-        valid_obs = []
-        valid_act = []
-        valid_rew = []
-        valid_don = []
+    def sample_sequence(self, batch_size, recent_only_pct=1.0, 
+                        force_terminal_rate=0.0, force_reward_rate=0.0):
         
         curr_size = self.capacity if self.full else self.pos
-        
-        if curr_size < self.seq_len:
-            return None
+        if curr_size < self.seq_len: return None
 
-        start_bound = 0
-        if recent_only_pct < 1.0:
-            start_bound = int(curr_size * (1.0 - recent_only_pct))
+        # Clamp rates to ensure sum <= 1.0 implicitly via counts
+        target_terminals = int(batch_size * force_terminal_rate)
+        target_rewards = int(batch_size * force_reward_rate)
         
-        count = 0
-        attempts = 0
-        max_attempts = batch_size * 50 # Safety break
+        # Ensure total targets do not exceed batch_size
+        if target_terminals + target_rewards > batch_size:
+            target_rewards = batch_size - target_terminals
+            if target_rewards < 0: target_rewards = 0
+
+        valid_indices = []
+        valid_envs = []
         
-        while count < batch_size and attempts < max_attempts:
-            attempts += 1
+        # Helper to sample from anchors
+        def sample_from_anchors(anchor_list, count):
+            chosen_idxs = []
+            chosen_envs = []
+            if not anchor_list: return [], []
             
-            # Pick random Environment
-            env_idx = np.random.randint(0, self.num_envs)
-            
-            # Pick random logical index (virtual time)
-            # We want a sequence of length seq_len ending at 'end_logical'
-            # So start_logical must be in [start_bound, curr_size - seq_len]
-            if start_bound >= curr_size - self.seq_len:
-                # Not enough recent data yet, fall back to full range
-                start_logical = np.random.randint(0, curr_size - self.seq_len)
-            else:
-                start_logical = np.random.randint(start_bound, curr_size - self.seq_len)
-            
-            if self.full:
-                start_t = (self.pos + start_logical) % self.capacity
-            else:
-                # If not full, 0 is 0.
-                start_t = start_logical
-            
-            if start_t + self.seq_len > self.capacity:
-                continue
+            n_anchors = len(anchor_list)
+            attempts = 0
+            while len(chosen_idxs) < count and attempts < count * 5:
+                attempts += 1
+                # Deque supports indexing, though O(N) worst case. 
+                # For sampling a few items, this is acceptable.
+                rand_idx = np.random.randint(n_anchors)
+                idx, env = anchor_list[rand_idx]
                 
-            end_t = start_t + self.seq_len
+                offset = np.random.randint(0, self.seq_len)
+                start = idx - offset
+                
+                # Handle Wrap
+                if start < 0:
+                    if self.full: start += self.capacity
+                    else: continue
+                
+                if not self.full:
+                    if start + self.seq_len > self.pos: continue
+                
+                if self.full:
+                    indices = (start + np.arange(self.seq_len)) % self.capacity
+                    if np.any(indices == self.pos): continue
+                
+                chosen_idxs.append(start)
+                chosen_envs.append(env)
             
-            # Check Dones
-            dones_seq = self.dones[start_t : end_t, env_idx]
+            return chosen_idxs, chosen_envs
+
+        # 1. Terminals
+        t_idxs, t_envs = sample_from_anchors(self.term_indices, target_terminals)
+        for i in range(len(t_idxs)):
+            valid_indices.append(t_idxs[i])
+            valid_envs.append(t_envs[i])
+        
+        # 2. Rewards
+        r_idxs, r_envs = sample_from_anchors(self.rew_indices, target_rewards)
+        for i in range(len(r_idxs)):
+            valid_indices.append(r_idxs[i])
+            valid_envs.append(r_envs[i])
             
-            # We reject if a done occurs in the middle [0 ... T-2]
-            # We allow done at [T-1] (end of sequence)
-            if np.any(dones_seq[:-1] > 0):
-                continue
-
-            # 5. Retrieve Data
-            seq_obs = self.obs[start_t : end_t, env_idx]
-            seq_act = self.actions[start_t : end_t, env_idx]
-            seq_rew = self.rewards[start_t : end_t, env_idx]
-            seq_don = self.dones[start_t : end_t, env_idx]
-
-            valid_obs.append(seq_obs)
-            valid_act.append(seq_act)
-            valid_rew.append(seq_rew)
-            valid_don.append(seq_don)
-            count += 1
+        # 3. Fill Remainder
+        needed = batch_size - len(valid_indices)
+        if needed > 0:
+            start_bound = 0
+            if recent_only_pct < 1.0:
+                start_bound = int(curr_size * (1.0 - recent_only_pct))
             
-        if count < batch_size:
-            return None # Should not happen often once buffer is filled
+            attempts = 0
+            while len(valid_indices) < batch_size and attempts < needed * 5:
+                attempts += 1
+                env = np.random.randint(0, self.num_envs)
+                
+                if self.full:
+                    start = np.random.randint(start_bound, self.capacity)
+                    idxs = (start + np.arange(self.seq_len)) % self.capacity
+                    if np.any(idxs == self.pos): continue
+                else:
+                    max_start = self.pos - self.seq_len
+                    if max_start < start_bound: max_start = start_bound
+                    start = np.random.randint(start_bound, max_start + 1)
+                
+                valid_indices.append(start)
+                valid_envs.append(env)
 
-        # Stack into (Batch, Time, ...)
-        batch_obs = np.stack(valid_obs).astype(np.float32) / 255.0
-        batch_act = np.stack(valid_act)
-        batch_rew = np.stack(valid_rew)
-        batch_don = np.stack(valid_don)
+        final_indices = np.array(valid_indices[:batch_size])
+        final_envs = np.array(valid_envs[:batch_size])
+        
+        if self.full:
+            seq_idxs = (final_indices[:, None] + np.arange(self.seq_len)) % self.capacity
+        else:
+            seq_idxs = final_indices[:, None] + np.arange(self.seq_len)
+            
+        final_envs_expanded = final_envs[:, None]
+        
+        batch_obs = self.obs[seq_idxs, final_envs_expanded]
+        batch_next_obs = self.next_obs[seq_idxs, final_envs_expanded]
+        batch_act = self.actions[seq_idxs, final_envs_expanded]
+        batch_rew = self.rewards[seq_idxs, final_envs_expanded]
+        batch_boundary = self.dones[seq_idxs, final_envs_expanded]
+        batch_terminal = self.terminals[seq_idxs, final_envs_expanded]
+
+        batch_obs = batch_obs.astype(np.float32) / 255.0
+        batch_next_obs = batch_next_obs.astype(np.float32) / 255.0
 
         return (torch.tensor(batch_obs, dtype=torch.float32),
+                torch.tensor(batch_next_obs, dtype=torch.float32),
                 torch.tensor(batch_act, dtype=torch.long),
                 torch.tensor(batch_rew, dtype=torch.float32).unsqueeze(2),
-                torch.tensor(batch_don, dtype=torch.float32).unsqueeze(2))
+                torch.tensor(batch_boundary, dtype=torch.float32).unsqueeze(2),
+                torch.tensor(batch_terminal, dtype=torch.float32).unsqueeze(2)) 
 
     def __len__(self):
         return (self.capacity if self.full else self.pos) * self.num_envs

@@ -25,27 +25,21 @@ class PreprocessAtari(gym.ObservationWrapper):
         stacked_obs = np.stack(processed_frames, axis=0)
         return stacked_obs.astype(np.float32) / 255.0
 
-class ClipReward(gym.RewardWrapper):
-    def __init__(self, env):
-        super().__init__(env)
-    def reward(self, reward):
-        return np.sign(reward)
-
-def make_single_env():
+def make_single_env(env_name, mode='train'):
     gym.register_envs(ale_py)
-    env = gym.make("ALE/SpaceInvaders-v5", frameskip=1)
+    env = gym.make(env_name, frameskip=1)
+    
     env = gym.wrappers.AtariPreprocessing(
         env, noop_max=30, frame_skip=4, screen_size=84, 
-        terminal_on_life_loss=True, 
+        terminal_on_life_loss=False, 
         grayscale_obs=True
     )
     env = gym.wrappers.FrameStackObservation(env, 4)
     env = PreprocessAtari(env, size=(64, 64))
-    env = ClipReward(env)
     return env
 
-def make_vector_env(num_envs=8):
-    return AsyncVectorEnv([make_single_env for _ in range(num_envs)])
+def make_vector_env(num_envs, env_name, mode='train'):
+    return AsyncVectorEnv([lambda: make_single_env(env_name, mode) for _ in range(num_envs)])
 
 def get_device():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")

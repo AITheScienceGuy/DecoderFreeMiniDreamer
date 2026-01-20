@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
-from models import WorldModel, ActorCritic, ACTION_DIM, EMBED_DIM, STOCH_DIM, CLASS_DIM
+from models import WorldModel, ActorCritic, EMBED_DIM, STOCH_DIM, CLASS_DIM
 from utils import get_device, PreprocessAtari
 
 def make_eval_env():
@@ -24,7 +24,7 @@ def run_benchmark(n_episodes=50):
     env = make_eval_env() 
     
     print("Loading models...")
-    wm = WorldModel().to(device)
+    wm = WorldModel(action_dim=env.action_space.n).to(device)
     try:
         wm.load_state_dict(torch.load("world_model.pth", map_location=device))
     except FileNotFoundError:
@@ -32,7 +32,7 @@ def run_benchmark(n_episodes=50):
         return
     wm.eval()
 
-    agent = ActorCritic().to(device)
+    agent = ActorCritic(action_dim=env.action_space.n).to(device)
     try:
         agent.load_state_dict(torch.load("policy.pth", map_location=device))
     except FileNotFoundError:
@@ -44,7 +44,10 @@ def run_benchmark(n_episodes=50):
     
     print(f"Running benchmark over {n_episodes} episodes...")
     for i in tqdm(range(n_episodes)):
-        obs, _ = env.reset()
+        # 1. Capture info on reset
+        obs, info = env.reset()
+        current_lives = info["lives"]
+        
         done = False
         score = 0
         
@@ -57,19 +60,32 @@ def run_benchmark(n_episodes=50):
             
             with torch.no_grad():
                 embed = wm.encoder(obs_tensor)
-                action_one_hot = F.one_hot(torch.tensor([action_idx], device=device), ACTION_DIM).float()
+                
+                # Convert to one-hot for RSSM
+                action_one_hot = F.one_hot(torch.tensor([action_idx], device=device), env.action_space.n).float()
                 
                 h, logits = wm.rssm.step(h, z_flat, action_one_hot, embed)
                 z, z_flat = wm.get_stochastic_state(logits, hard=True)
                 
                 feat = wm.rssm.get_feat(h, z_flat)
                 
+                # Low temp for exploitation
                 action_probs = agent.get_action(feat, temperature=0.1)
-                action_idx = torch.argmax(action_probs).item()
+                action_idx = torch.distributions.Categorical(probs=action_probs).sample().item()
             
-            obs, reward, term, trunc, _ = env.step(action_idx)
+            # 2. Capture info on step
+            obs, reward, term, trunc, info = env.step(action_idx)
             done = term or trunc
             score += reward
+            
+            # 3. Detect Life Loss & Reset Latent State
+            # This matches the training logic to prevent the RNN from drifting after death
+            if info["lives"] < current_lives and info["lives"] > 0:
+                h = torch.zeros(1, EMBED_DIM, device=device)
+                z_flat = torch.zeros(1, STOCH_DIM * CLASS_DIM, device=device)
+                action_idx = 0 # Reset context to "no action"
+            
+            current_lives = info["lives"]
             
         scores.append(score)
 
@@ -78,6 +94,7 @@ def run_benchmark(n_episodes=50):
     
     print(f"\n--- Benchmark Results ({n_episodes} Episodes) ---")
     print(f"Average Score: {avg_score:.2f} +/- {std_score:.2f}")
+    env.close()
 
 if __name__ == "__main__":
     run_benchmark()
