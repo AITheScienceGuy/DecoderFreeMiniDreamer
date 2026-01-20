@@ -1,7 +1,7 @@
 # DecoderFreeMiniDreamer
 A decoder free version of my previous dreamer agent that uses a barlow twins self-supervised learning objective instead of a reconstruction loss.
 
-![Trained agent in Space Invaders](assets/SpaceInvaders.gif) ![Trained agent in Breakout](assets/Breakout.gif)
+![Trained agent in Space Invaders](assets/SpaceInvaders.gif) ![Trained agent in Breakout](assets/Breakout.gif) ![Trained agent in MsPacman](assets/MsPacman.gif)
 
 Model based reinforcement learning can be vastly more sample efficient than model free reinforcement learning. If we learn a model of the environment then we can do rollouts of the world model and train an agent in the world models "imagination". The recent success of DreamerV4 got me interested in this area of reinforcement learning research and inspired me to take on this project.
 
