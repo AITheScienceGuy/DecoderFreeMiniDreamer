@@ -18,6 +18,8 @@ BUCKET_HIGH = 20.0
 LATENT_UNIMIX = 0.01
 ACTOR_UNIMIX = 0.01
 
+HL_GAUSS_SIGMA_RATIO = 0.25  # good default to start with (tune later)
+
 def symlog(x):
     return torch.sign(x) * torch.log(torch.abs(x) + 1.0)
 
@@ -41,58 +43,61 @@ class RetNorm:
         self.scale = self.decay * self.scale + (1 - self.decay) * s
         return self.scale
 
-class TwoHotDist:
-    def __init__(self, logits=None, low=BUCKET_LOW, high=BUCKET_HIGH, bins=NUM_BUCKETS):
+class HLGaussDist:
+    def __init__(self, logits=None, low=BUCKET_LOW, high=BUCKET_HIGH, bins=NUM_BUCKETS, sigma_ratio=HL_GAUSS_SIGMA_RATIO):
         self.logits = logits
         self.probs = F.softmax(logits, dim=-1) if logits is not None else None
-        self.bins = torch.linspace(low, high, bins, device=logits.device if logits is not None else 'cpu')
-        self.low = low
-        self.high = high
+        self.low, self.high, self.bins = low, high, bins
+
+        # Edges (num_bins + 1), centers (num_bins)
+        device = logits.device if logits is not None else 'cpu'
+        self.support = torch.linspace(low, high, bins + 1, device=device, dtype=torch.float32)
+        self.centers = (self.support[:-1] + self.support[1:]) / 2.0
+
+        # sigma as a fraction of bin width
+        bin_width = (high - low) / bins
+        self.sigma = sigma_ratio * bin_width
 
     def mean_linear(self):
-        return (self.probs * symexp(self.bins)).sum(dim=-1, keepdim=True)
+        # centers are in symlog-space in your pipeline, so map back with symexp
+        return (self.probs * symexp(self.centers)).sum(dim=-1, keepdim=True)
 
     def to_symlog_scalar(self):
-        return (self.probs * self.bins).sum(dim=-1, keepdim=True)
+        return (self.probs * self.centers).sum(dim=-1, keepdim=True)
+
+    def transform_to_probs(self, target_symlog):
+        # target_symlog: shape (...,) or (..., 1) -> squeeze last dim if present
+        t = target_symlog.squeeze(-1)
+        t = torch.clamp(t, self.low, self.high)
+
+        # Match Stop Regressing listing: erf((support - target) / (sqrt(2)*sigma))
+        denom = torch.sqrt(torch.tensor(2.0, device=t.device, dtype=torch.float32)) * self.sigma
+        cdf_evals = torch.special.erf((self.support - t.unsqueeze(-1)) / denom)  # (..., bins+1)
+
+        z = cdf_evals[..., -1] - cdf_evals[..., 0]                              # (...)
+        bin_probs = cdf_evals[..., 1:] - cdf_evals[..., :-1]                    # (..., bins)
+
+        # Normalize for truncation at edges (as in the paper)
+        return bin_probs / (z.unsqueeze(-1) + 1e-8)
 
     @staticmethod
-    def compute_loss(logits, targets):
-        """Returns scalar mean loss."""
-        loss_elem = TwoHotDist.compute_loss_elem(logits, targets)
-        return loss_elem.mean()
+    def compute_loss_elem(logits, targets_symlog, low=BUCKET_LOW, high=BUCKET_HIGH, bins=NUM_BUCKETS, sigma_ratio=HL_GAUSS_SIGMA_RATIO):
+        # logits: (..., bins), targets_symlog: (..., 1) or (...)
+        support = torch.linspace(low, high, bins + 1, device=logits.device, dtype=torch.float32)
+        bin_width = (high - low) / bins
+        sigma = sigma_ratio * bin_width
 
-    @staticmethod
-    def compute_loss_elem(logits, targets):
-        """
-        Returns element-wise loss (NLL) with shape matching targets (B, ...) or (T, B, ...).
-        Preserves dimensions so weights can be applied correctly.
-        """
-        targets = torch.clamp(targets, BUCKET_LOW, BUCKET_HIGH)
-        bins = torch.linspace(BUCKET_LOW, BUCKET_HIGH, NUM_BUCKETS, device=logits.device)
-        bucket_width = bins[1] - bins[0]
-        
-        indices = (targets - BUCKET_LOW) / bucket_width
-        low_idx = indices.floor().long()
-        high_idx = low_idx + 1
-        
-        weight_high = indices - low_idx.float()
-        weight_low = 1.0 - weight_high
-        
-        high_idx = torch.clamp(high_idx, 0, NUM_BUCKETS - 1)
-        low_idx = torch.clamp(low_idx, 0, NUM_BUCKETS - 1)
-        
-        log_probs = F.log_softmax(logits, dim=-1)
-        
-        # Flatten for gather
-        batch_shape = logits.shape[:-1]
-        flat_log_probs = log_probs.reshape(-1, NUM_BUCKETS)
-        
-        lp_low = flat_log_probs.gather(1, low_idx.view(-1, 1)).squeeze(-1)
-        lp_high = flat_log_probs.gather(1, high_idx.view(-1, 1)).squeeze(-1)
-        
-        ce = -(weight_low.view(-1) * lp_low + weight_high.view(-1) * lp_high)
-        
-        return ce.view(*batch_shape, 1)
+        t = targets_symlog.squeeze(-1)
+        t = torch.clamp(t, low, high)
+
+        denom = torch.sqrt(torch.tensor(2.0, device=logits.device, dtype=torch.float32)) * sigma
+        cdf_evals = torch.special.erf((support - t.unsqueeze(-1)) / denom)
+        z = cdf_evals[..., -1] - cdf_evals[..., 0]
+        target_probs = (cdf_evals[..., 1:] - cdf_evals[..., :-1]) / (z.unsqueeze(-1) + 1e-8)
+
+        logp = F.log_softmax(logits, dim=-1)
+        ce = -(target_probs * logp).sum(dim=-1, keepdim=True)  # (..., 1)
+        return ce
 
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-8):

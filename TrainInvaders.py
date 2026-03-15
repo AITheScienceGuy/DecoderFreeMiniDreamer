@@ -14,7 +14,7 @@ from torch.distributions import Categorical, OneHotCategorical
 from torch.amp import GradScaler, autocast 
 
 from utils import make_vector_env, get_device, make_single_env
-from models import WorldModel, ActorCritic, EMBED_DIM, STOCH_DIM, CLASS_DIM, TwoHotDist, symlog, symexp, RetNorm
+from models import WorldModel, ActorCritic, EMBED_DIM, STOCH_DIM, CLASS_DIM, HLGaussDist, symlog, symexp, RetNorm
 from buffer import ReplayBuffer
 
 # --- ENVIRONMENT CONFIGURATION ---
@@ -77,20 +77,6 @@ def unimix_probs(logits, mix=0.01):
 def onehot_dist_from_logits(logits, mix=0.01):
     return torch.distributions.OneHotCategorical(probs=unimix_probs(logits, mix))
 
-def twohot_loss_per_sample(logits, targets, low=-20.0, high=20.0, num_buckets=255):
-    B = logits.shape[0]
-    bin_size = (high - low) / (num_buckets - 1)
-    t = targets.clamp(low, high)
-    pos = (t - low) / bin_size
-    idx0 = pos.floor().long().clamp(0, num_buckets - 1)
-    idx1 = (idx0 + 1).clamp(0, num_buckets - 1)
-    w1 = (pos - idx0.float()).clamp(0.0, 1.0)
-    w0 = 1.0 - w1
-    logp = F.log_softmax(logits, dim=-1)
-    lp0 = logp[torch.arange(B, device=logits.device), idx0]
-    lp1 = logp[torch.arange(B, device=logits.device), idx1]
-    return -(w0 * lp0 + w1 * lp1)
-
 def check_model_rollout(wm, buffer, action_dim, device, horizon=10):
     wm.eval()
     batch = buffer.sample_sequence_pser(BATCH_SIZE, recent_only_pct=0.3)
@@ -98,7 +84,7 @@ def check_model_rollout(wm, buffer, action_dim, device, horizon=10):
     
     # UNPACK PSER
     b_obs, b_next_obs, b_act, b_rew, b_bound, b_term = batch[:6]
-    b_obs, b_next_obs, b_act, b_rew, b_bound, b_term = [x.to(device) for x in (b_obs, b_next_obs, b_act, b_rew, b_bound, b_term)]
+    b_obs, b_next_obs, b_act, b_rew, b_bound, b_term =[x.to(device) for x in (b_obs, b_next_obs, b_act, b_rew, b_bound, b_term)]
     
     if b_obs.shape[1] < BURN_IN_STEPS + horizon + 1: return
 
@@ -121,7 +107,7 @@ def check_model_rollout(wm, buffer, action_dim, device, horizon=10):
             _, z_f = wm.get_stochastic_state(logits, hard=True)
 
         rew_errs = []
-        done_accs = []
+        done_accs =[]
         
         for t in range(horizon):
             idx = BURN_IN_STEPS + t
@@ -132,7 +118,10 @@ def check_model_rollout(wm, buffer, action_dim, device, horizon=10):
             h, prior_logits = wm.rssm.step(h, z_f, real_act, embed=None)
             _, z_f = wm.get_stochastic_state(prior_logits, hard=True)
             feat = wm.rssm.get_feat(h, z_f)
-            pred_rew = TwoHotDist(logits=wm.reward_head(feat)).mean_linear()
+            
+            # Using HL-Gauss decoding
+            pred_rew = HLGaussDist(logits=wm.reward_head(feat)).mean_linear()
+            
             pred_done_prob = torch.sigmoid(wm.done_head(feat))
             real_rew = b_rew[:, idx-1]
             real_done = b_term[:, idx-1]
@@ -150,7 +139,7 @@ def check_model_rollout(wm, buffer, action_dim, device, horizon=10):
 def evaluate_agent(wm, agent, action_dim, device, num_episodes=10):
     global global_step_eval
     wm.eval(); agent.eval()
-    episode_returns = []
+    episode_returns =[]
     for _ in range(num_episodes):
         env = make_single_env(ENV_NAME, mode='eval')
         obs, info = env.reset()
@@ -268,7 +257,7 @@ def train_world_model(buffer, model, optimizer, scaler, action_dim, device, epoc
         if batch is None: continue
         
         b_obs, b_next_obs, b_act, b_rew, b_bound, b_term, is_w, starts, envs = batch
-        b_obs, b_next_obs, b_act, b_rew, b_bound, b_term, is_w = [x.to(device) for x in (b_obs, b_next_obs, b_act, b_rew, b_bound, b_term, is_w)]
+        b_obs, b_next_obs, b_act, b_rew, b_bound, b_term, is_w =[x.to(device) for x in (b_obs, b_next_obs, b_act, b_rew, b_bound, b_term, is_w)]
         b_rew_sym = symlog(b_rew)
         
         optimizer.zero_grad()
@@ -281,8 +270,8 @@ def train_world_model(buffer, model, optimizer, scaler, action_dim, device, epoc
             
             loss_kl, loss_rew, loss_done = 0, 0, 0
             state_feats_list = []
-            emb_target_list = []
-            mae_rew_list = []
+            emb_target_list =[]
+            mae_rew_list =[]
             
             flat_targets = b_term.float()
             n_valid = flat_targets.numel()
@@ -323,10 +312,14 @@ def train_world_model(buffer, model, optimizer, scaler, action_dim, device, epoc
                 state_feats_list.append(feat_post)
                 emb_target_list.append(embeds_target[:, t])
                 
+                # Using HL-Gauss for Reward Head
                 pred_rew_logits = model.reward_head(feat_post)
-                rew_loss_elem = twohot_loss_per_sample(pred_rew_logits, b_rew_sym[:, t].squeeze(-1))
+                rew_loss_elem = HLGaussDist.compute_loss_elem(
+                    pred_rew_logits,
+                    b_rew_sym[:, t]
+                )
         
-                loss_rew  += (rew_loss_elem  * w).sum() / (w.sum() + 1e-8)
+                loss_rew  += (rew_loss_elem.squeeze(-1) * w).sum() / (w.sum() + 1e-8)
                 
                 pred_done_logits = model.done_head(feat_post)
                 done_loss_elem = F.binary_cross_entropy_with_logits(
@@ -334,10 +327,10 @@ def train_world_model(buffer, model, optimizer, scaler, action_dim, device, epoc
                 ).squeeze(-1)
                 loss_done += (done_loss_elem * w).sum() / (w.sum() + 1e-8)
 
-                seq_pri += (rew_loss_elem.detach() + done_loss_elem.detach() + kl_dyn_c.detach() + kl_rep_c.detach())
+                seq_pri += (rew_loss_elem.squeeze(-1).detach() + done_loss_elem.detach() + kl_dyn_c.detach() + kl_rep_c.detach())
                 
                 with torch.no_grad():
-                     mae_rew_list.append((TwoHotDist(logits=pred_rew_logits).mean_linear() - b_rew[:, t]).abs().mean())
+                     mae_rew_list.append((HLGaussDist(logits=pred_rew_logits).mean_linear() - b_rew[:, t]).abs().mean())
 
             # Update priorities with clipping
             new_pris = (seq_pri / T).detach().cpu().numpy()
@@ -367,7 +360,7 @@ def train_world_model(buffer, model, optimizer, scaler, action_dim, device, epoc
             writer.add_scalar("sanity/rew_mae_global", torch.stack(mae_rew_list).mean().item(), global_step_wm)
 
 def compute_lambda_returns(rewards, values, continues, gamma=0.99, lamb=0.95):
-    returns = []
+    returns =[]
     last = values[-1]
     for t in reversed(range(len(rewards))):
         disc = gamma * continues[t]
@@ -390,7 +383,7 @@ def train_policy_dreamer(buffer, wm, agent, opt_act, opt_crit, scaler_a, scaler_
         if batch is None: continue
         
         b_obs, b_next_obs, b_act, b_rew, b_bound, b_term, is_w, starts, envs = batch
-        b_obs, b_next_obs, b_act, b_rew, b_bound, b_term, is_w = [x.to(device) for x in (b_obs, b_next_obs, b_act, b_rew, b_bound, b_term, is_w)]
+        b_obs, b_next_obs, b_act, b_rew, b_bound, b_term, is_w =[x.to(device) for x in (b_obs, b_next_obs, b_act, b_rew, b_bound, b_term, is_w)]
         
         with torch.no_grad(), autocast(device_type=device.type, enabled=use_amp):
             B, T_ctx = b_obs[:, :BURN_IN_STEPS].shape[:2]
@@ -407,13 +400,13 @@ def train_policy_dreamer(buffer, wm, agent, opt_act, opt_crit, scaler_a, scaler_
 
         opt_act.zero_grad(); opt_crit.zero_grad()
         with autocast(device_type=device.type, enabled=use_amp):
-            l_rew_lin, l_val_lin, l_continue_probs, l_ent = [], [], [], []
-            l_val_logits, l_logp = [], []
+            l_rew_lin, l_val_lin, l_continue_probs, l_ent = [], [], [],[]
+            l_val_logits, l_logp = [],[]
             curr_h, curr_z = h, z_f
             
             v_logits = agent.critic(wm.rssm.get_feat(h, z_f))
             l_val_logits.append(v_logits)
-            l_val_lin.append(TwoHotDist(logits=v_logits).mean_linear())
+            l_val_lin.append(HLGaussDist(logits=v_logits).mean_linear())
 
             for _ in range(IMAGINE_HORIZON):
                 feat = wm.rssm.get_feat(curr_h, curr_z)
@@ -426,11 +419,14 @@ def train_policy_dreamer(buffer, wm, agent, opt_act, opt_crit, scaler_a, scaler_
                 curr_h, logits = wm.rssm.step(curr_h, curr_z, action_oh, None)
                 _, curr_z = wm.get_stochastic_state(logits, hard=True)
                 feat_next = wm.rssm.get_feat(curr_h, curr_z)
-                l_rew_lin.append(TwoHotDist(logits=wm.reward_head(feat_next)).mean_linear())
+                
+                l_rew_lin.append(HLGaussDist(logits=wm.reward_head(feat_next)).mean_linear())
+                
                 l_continue_probs.append((1.0 - torch.sigmoid(wm.done_head(feat_next))).clamp(0.0, 1.0))
                 v_logits_next = agent.critic(feat_next)
                 l_val_logits.append(v_logits_next)
-                l_val_lin.append(TwoHotDist(logits=v_logits_next).mean_linear())
+                
+                l_val_lin.append(HLGaussDist(logits=v_logits_next).mean_linear())
                 
             rets_linear = compute_lambda_returns(
                 torch.stack(l_rew_lin), torch.stack(l_val_lin).detach(), torch.stack(l_continue_probs),
@@ -438,7 +434,9 @@ def train_policy_dreamer(buffer, wm, agent, opt_act, opt_crit, scaler_a, scaler_
             )
             target_v_symlog = symlog(rets_linear.detach())
             pred_logits = torch.stack(l_val_logits)[:-1] 
-            crit_loss_elem = TwoHotDist.compute_loss_elem(pred_logits, target_v_symlog) 
+            
+            # Use HL-Gauss for Critic Loss calculation
+            crit_loss_elem = HLGaussDist.compute_loss_elem(pred_logits, target_v_symlog) 
             
             with torch.no_grad():
                 pri_update = crit_loss_elem.squeeze(-1).mean(0).cpu().numpy()
@@ -531,5 +529,5 @@ def main():
         train_envs.close()
 
 if __name__ == "__main__":
-    writer = SummaryWriter(log_dir=f"runs/Atari")
+    writer = SummaryWriter(log_dir=f"runs/Breakout")
     main()
